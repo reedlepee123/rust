@@ -28,7 +28,7 @@ use path_util::{target_executable_in_workspace, target_test_in_workspace,
                library_in_workspace, installed_library_in_workspace,
                built_bench_in_workspace, built_test_in_workspace,
                built_library_in_workspace, built_executable_in_workspace, target_build_dir,
-               chmod_read_only};
+               chmod_read_only, platform_library_name};
 use rustc::back::link::get_cc_prog;
 use rustc::metadata::filesearch::rust_path;
 use rustc::driver::driver::{build_session, build_session_options, host_triple, optgroups};
@@ -295,14 +295,8 @@ fn command_line_test_with_env(args: &[~str], cwd: &Path, env: Option<~[(~str, ~s
                     cmd, args, str::from_utf8(output.output),
                    str::from_utf8(output.error),
                    output.status);
-/*
-By the way, rustpkg *won't* return a nonzero exit code if it fails --
-see #4547
-So tests that use this need to check the existence of a file
-to make sure the command succeeded
-*/
     if output.status != 0 {
-        debug2!("Command {} {:?} failed with exit code {:?}; its output was --- {} ---",
+        debug2!("Command {} {:?} failed with exit code {:?} -- its output was:\n{}",
               cmd, args, output.status,
               str::from_utf8(output.output) + str::from_utf8(output.error));
         Fail(output.status)
@@ -568,7 +562,7 @@ fn test_install_valid() {
                           temp_workspace.clone(),
                           false,
                           temp_pkg_id.clone());
-    ctxt.install(src, &Everything);
+    ctxt.install(src, &WhatToBuild::new(MaybeCustom, Everything));
     // Check that all files exist
     let exec = target_executable_in_workspace(&temp_pkg_id, temp_workspace);
     debug2!("exec = {}", exec.to_str());
@@ -606,7 +600,7 @@ fn test_install_invalid() {
                                   temp_workspace.clone(),
                                   false,
                                   pkgid.clone());
-        ctxt.install(pkg_src, &Everything);
+        ctxt.install(pkg_src, &WhatToBuild::new(MaybeCustom, Everything));
     };
     // Not the best test -- doesn't test that we failed in the right way.
     // Best we can do for now.
@@ -818,13 +812,12 @@ fn rustpkg_local_pkg() {
 }
 
 #[test]
-#[ignore (reason = "test makes bogus assumptions about build directory layout: issue #8690")]
 fn package_script_with_default_build() {
     let dir = create_local_package(&PkgId::new("fancy-lib"));
     let dir = dir.path();
     debug2!("dir = {}", dir.to_str());
-    let source = test_sysroot().pop().pop().pop().push_many(
-        [~"src", ~"librustpkg", ~"testsuite", ~"pass", ~"src", ~"fancy-lib", ~"pkg.rs"]);
+    let source = Path(file!()).pop().push_many(
+        [~"testsuite", ~"pass", ~"src", ~"fancy-lib", ~"pkg.rs"]);
     debug2!("package_script_with_default_build: {}", source.to_str());
     if !os::copy_file(&source,
                       &dir.push_many([~"src", ~"fancy-lib-0.1", ~"pkg.rs"])) {
@@ -833,6 +826,9 @@ fn package_script_with_default_build() {
     command_line_test([~"install", ~"fancy-lib"], dir);
     assert_lib_exists(dir, &Path("fancy-lib"), NoVersion);
     assert!(os::path_exists(&target_build_dir(dir).push_many([~"fancy-lib", ~"generated.rs"])));
+    let generated_path = target_build_dir(dir).push_many([~"fancy-lib", ~"generated.rs"]);
+    debug2!("generated path = {}", generated_path.to_str());
+    assert!(os::path_exists(&generated_path));
 }
 
 #[test]
@@ -2081,6 +2077,106 @@ fn test_compile_error() {
         Fail(status) => {
             debug2!("Failed with status {:?}... that's good, right?", status);
         }
+    }
+}
+
+fn test_c_dependency_ok() {
+    // Pkg has a custom build script that adds a single C file as a dependency, and
+    // registers a hook to build it if it's not fresh
+    // After running `build`, test that the C library built
+
+    let dir = create_local_package(&PkgId::new("cdep"));
+    let dir = dir.path();
+    writeFile(&dir.push_many(["src", "cdep-0.1", "main.rs"]),
+              "#[link_args = \"-lfoo\"]\nextern { fn f(); } \
+              \n#[fixed_stack_segment]\nfn main() { unsafe { f(); } }");
+    writeFile(&dir.push_many(["src", "cdep-0.1", "foo.c"]), "void f() {}");
+
+    debug2!("dir = {}", dir.to_str());
+    let source = Path(file!()).pop().push_many(
+        [~"testsuite", ~"pass", ~"src", ~"c-dependencies", ~"pkg.rs"]);
+    if !os::copy_file(&source,
+                      &dir.push_many([~"src", ~"cdep-0.1", ~"pkg.rs"])) {
+        fail2!("Couldn't copy file");
+    }
+    command_line_test([~"build", ~"cdep"], dir);
+    assert_executable_exists(dir, "cdep");
+    let out_dir = target_build_dir(dir).push("cdep");
+    let c_library_path = out_dir.push(platform_library_name("foo"));
+    debug2!("c library path: {}", c_library_path.to_str());
+    assert!(os::path_exists(&c_library_path));
+}
+
+#[test]
+fn test_c_dependency_no_rebuilding() {
+    let dir = create_local_package(&PkgId::new("cdep"));
+    let dir = dir.path();
+    writeFile(&dir.push_many(["src", "cdep-0.1", "main.rs"]),
+              "#[link_args = \"-lfoo\"]\nextern { fn f(); } \
+              \n#[fixed_stack_segment]\nfn main() { unsafe { f(); } }");
+    writeFile(&dir.push_many(["src", "cdep-0.1", "foo.c"]), "void f() {}");
+
+    debug2!("dir = {}", dir.to_str());
+    let source = Path(file!()).pop().push_many(
+        [~"testsuite", ~"pass", ~"src", ~"c-dependencies", ~"pkg.rs"]);
+    if !os::copy_file(&source,
+                      &dir.push_many([~"src", ~"cdep-0.1", ~"pkg.rs"])) {
+        fail2!("Couldn't copy file");
+    }
+    command_line_test([~"build", ~"cdep"], dir);
+    assert_executable_exists(dir, "cdep");
+    let out_dir = target_build_dir(dir).push("cdep");
+    let c_library_path = out_dir.push(platform_library_name("foo"));
+    debug2!("c library path: {}", c_library_path.to_str());
+    assert!(os::path_exists(&c_library_path));
+
+    // Now, make it read-only so rebuilding will fail
+    assert!(chmod_read_only(&c_library_path));
+
+    match command_line_test_partial([~"build", ~"cdep"], dir) {
+        Success(*) => (), // ok
+        Fail(status) if status == 65 => fail2!("test_c_dependency_no_rebuilding failed: \
+                                              it tried to rebuild foo.c"),
+        Fail(_) => fail2!("test_c_dependency_no_rebuilding failed for some other reason")
+    }
+}
+
+#[test]
+#[ignore(cfg(unix,not(target_os = "macos")), reason = "See #9441")]
+fn test_c_dependency_yes_rebuilding() {
+    let dir = create_local_package(&PkgId::new("cdep"));
+    let dir = dir.path();
+    writeFile(&dir.push_many(["src", "cdep-0.1", "main.rs"]),
+              "#[link_args = \"-lfoo\"]\nextern { fn f(); } \
+              \n#[fixed_stack_segment]\nfn main() { unsafe { f(); } }");
+    let c_file_name = dir.push_many(["src", "cdep-0.1", "foo.c"]);
+    writeFile(&c_file_name, "void f() {}");
+
+    let source = Path(file!()).pop().push_many(
+        [~"testsuite", ~"pass", ~"src", ~"c-dependencies", ~"pkg.rs"]);
+    let target = dir.push_many([~"src", ~"cdep-0.1", ~"pkg.rs"]);
+    debug2!("Copying {} -> {}", source.to_str(), target.to_str());
+    if !os::copy_file(&source, &target) {
+        fail2!("Couldn't copy file");
+    }
+    command_line_test([~"build", ~"cdep"], dir);
+    assert_executable_exists(dir, "cdep");
+    let out_dir = target_build_dir(dir).push("cdep");
+    let c_library_path = out_dir.push(platform_library_name("foo"));
+    debug2!("c library path: {}", c_library_path.to_str());
+    assert!(os::path_exists(&c_library_path));
+
+    // Now, make the Rust library read-only so rebuilding will fail
+    match built_library_in_workspace(&PkgId::new("cdep"), dir) {
+        Some(ref pth) => assert!(chmod_read_only(pth)),
+        None => assert_built_library_exists(dir, "cdep")
+    }
+
+    match command_line_test_partial([~"build", ~"cdep"], dir) {
+        Success(*) => fail2!("test_c_dependency_yes_rebuilding failed: \
+                            it didn't rebuild and should have"),
+        Fail(status) if status == 65 => (),
+        Fail(_) => fail2!("test_c_dependency_yes_rebuilding failed for some other reason")
     }
 }
 

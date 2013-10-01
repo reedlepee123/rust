@@ -23,7 +23,7 @@ use path_util::{find_dir_using_rust_path_hack, make_dir_rwx_recursive};
 use path_util::{target_build_dir, versionize};
 use util::compile_crate;
 use workcache_support;
-use workcache_support::crate_tag;
+use workcache_support::{digest_only_date, digest_file_with_date, crate_tag};
 use extra::workcache;
 
 // An enumeration of the unpacked source of a package workspace.
@@ -360,7 +360,8 @@ impl PkgSrc {
                     ctx: &BuildContext,
                     crates: &[Crate],
                     cfgs: &[~str],
-                    what: OutputType) {
+                    what: OutputType,
+                    inputs_to_discover: &[(~str, Path)]) {
         for crate in crates.iter() {
             let path = self.start_dir.push_rel(&crate.file).normalize();
             debug2!("build_crates: compiling {}", path.to_str());
@@ -378,7 +379,18 @@ impl PkgSrc {
                 let id = self.id.clone();
                 let sub_dir = self.build_workspace().clone();
                 let sub_flags = crate.flags.clone();
+                let inputs = inputs_to_discover.map(|&(ref k, ref p)| (k.clone(), p.to_str()));
                 do prep.exec |exec| {
+                    for &(ref kind, ref p) in inputs.iter() {
+                        let pth = Path(*p);
+                        exec.discover_input(*kind, *p, if *kind == ~"file" {
+                                digest_file_with_date(&pth)
+                            } else if *kind == ~"binary" {
+                                digest_only_date(&Path(*p))
+                            } else {
+                                fail2!("Bad kind in build_crates")
+                            });
+                    }
                     let result = compile_crate(&subcx,
                                                exec,
                                                &id,
@@ -416,20 +428,38 @@ impl PkgSrc {
     // Encodable.
     pub fn build(&self,
                  build_context: &BuildContext,
-                 cfgs: ~[~str]) {
+                 cfgs: ~[~str],
+                 inputs_to_discover: &[(~str, Path)]) {
         let libs = self.libs.clone();
         let mains = self.mains.clone();
         let tests = self.tests.clone();
         let benchs = self.benchs.clone();
         debug2!("Building libs in {}, destination = {}",
-               self.source_workspace.to_str(), self.build_workspace().to_str());
-        self.build_crates(build_context, libs, cfgs, Lib);
+               self.destination_workspace.to_str(),
+               self.destination_workspace.to_str());
+        self.build_crates(build_context,
+                          libs,
+                          cfgs,
+                          Lib,
+                          inputs_to_discover);
         debug2!("Building mains");
-        self.build_crates(build_context, mains, cfgs, Main);
+        self.build_crates(build_context,
+                          mains,
+                          cfgs,
+                          Main,
+                          inputs_to_discover);
         debug2!("Building tests");
-        self.build_crates(build_context, tests, cfgs, Test);
+        self.build_crates(build_context,
+                          tests,
+                          cfgs,
+                          Test,
+                          inputs_to_discover);
         debug2!("Building benches");
-        self.build_crates(build_context, benchs, cfgs, Bench);
+        self.build_crates(build_context,
+                          benchs,
+                          cfgs,
+                          Bench,
+                          inputs_to_discover);
     }
 
     /// Return the workspace to put temporary files in. See the comment on `PkgSrc`
